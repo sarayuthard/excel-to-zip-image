@@ -10,6 +10,18 @@ st.set_page_config(page_title="📸 Excel → ZIP Image Downloader", layout="cen
 st.title("📸 แปลง URL รูปภาพจาก Excel เป็น ZIP ไฟล์")
 st.caption("📎 แนบไฟล์ Excel ที่มีคอลัมน์ชื่อ 'Item' และ 'URL'")
 
+# 🔵 แสดงรูปตัวอย่าง
+st.image("example.png", caption="ตัวอย่างไฟล์ Excel ที่ต้องการ", use_container_width=True)
+
+# 🔵 ปุ่มดาวน์โหลดไฟล์ Template
+with open("Template.xlsx", "rb") as template_file:
+    st.download_button(
+        label="📥 ดาวน์โหลดไฟล์ตัวอย่าง (Template)",
+        data=template_file,
+        file_name="Template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
 # รับไฟล์ Excel
 uploaded_file = st.file_uploader("Drag and drop file here", type=["xlsx", "xls"])
 
