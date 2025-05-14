@@ -1,100 +1,279 @@
-import streamlit as st
-import pandas as pd
-import requests
+from flask import Flask, request, send_file, render_template_string
+import os
+import fitz  # PyMuPDF
 import zipfile
-import io
-import re
-import concurrent.futures
+from io import BytesIO
 
-st.set_page_config(page_title="📸 Excel → ZIP Image Downloader", layout="centered")
+app = Flask(__name__)
+UPLOAD_FOLDER = 'uploads'
+OUTPUT_FOLDER = 'output'
 
-st.title("📸 แปลง URL รูปภาพจาก Excel เป็น ZIP ไฟล์")
-st.caption("📌 แนบไฟล์ Excel ที่มีคอลัมน์ชื่อ 'Item' และ 'URL'")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# 🔵 แสดงรูปตัวอย่าง
-st.image("example.png", caption="ตัวอย่างไฟล์ Excel ที่ต้องการ", use_container_width=True)
+new_header_lines = [
+    "บริษัท เวิร์ค สเตชั่น ออฟฟิศ (ประเทศไทย) จำกัด",
+    "ที่อยู่: 440 442 พระราม 2 ซ. 50 แขวงแสมดำ เขตบางขุนเทียน กรุงเทพมหานคร 10150",
+    "โทรศัพท์: 021004740, อีเมล: inventory@workstationoffice.com",
+    "เลขผู้เสียภาษี: 0105552123122"
+]
 
-# 🔵 ปุ่มดาวน์โหลดไฟล์ Template
-with open("Template.xlsx", "rb") as template_file:
-    st.download_button(
-        label="👥 ดาวน์โหลดไฟล์ตัวอย่าง (Template)",
-        data=template_file,
-        file_name="Template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+header_settings = {
+    "tax":     {"rect": (0, 0, 425, 100), "text_x": 30, "text_y": 40, "fontsize": 11, "line_spacing": 18},
+    "receipt": {"rect": (0, 0, 425, 100), "text_x": 30, "text_y": 40, "fontsize": 11, "line_spacing": 18},
+    "both":    {"rect": (0, 0, 425, 100), "text_x": 30, "text_y": 40, "fontsize": 11, "line_spacing": 18},
+}
 
-# รับไฟล์ Excel
-uploaded_file = st.file_uploader("Drag and drop file here", type=["xlsx", "xls"])
+HTML_TEMPLATE = '''
+<!doctype html>
+<html lang="th">
+<head>
+    <meta charset="utf-8">
+    <title>เปลี่ยนหัวกระดาษ PDF</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background-color: #f4f4f4;
+            padding: 30px;
+            color: #333;
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+        }
+        .section {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px auto;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            max-width: 600px;
+        }
+        input[type=file] {
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 10px;
+        }
+        input[type=submit] {
+            background-color: #3498db;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        input[type=submit]:hover {
+            background-color: #2980b9;
+        }
+    </style>
+</head>
+<body>
+    <h1>เครื่องมือเปลี่ยนหัวกระดาษ PDF</h1>
 
-# สร้างตัวแปร failed_downloads เก็บไว้ข้างนอก เพื่อไม่ให้หายไป
-if 'failed_downloads' not in st.session_state:
-    st.session_state.failed_downloads = []
+    <div class="section">
+        <h2>สำหรับ ใบกํากับภาษี</h2>
+        <form action="/tax" method=post enctype=multipart/form-data>
+            <input type=file name=pdfs multiple required>
+            <input type=submit value="แปลงไฟล์">
+        </form>
+    </div>
 
-def download_image(index_item_url):
-    index, item, url = index_item_url
-    if pd.isna(url):
-        return None
-    safe_item_name = re.sub(r'[\\/*?:"<>|]', "_", str(item).strip())
+    <div class="section">
+        <h2>สำหรับ ใบเสร็จรับเงิน</h2>
+        <form action="/receipt" method=post enctype=multipart/form-data>
+            <input type=file name=pdfs multiple required>
+            <input type=submit value="แปลงไฟล์">
+        </form>
+    </div>
 
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            return (index, safe_item_name, url, response.content)
-    except Exception:
-        return (index, safe_item_name, url, None)
-    return (index, safe_item_name, url, None)
+    <div class="section">
+        <h2>สำหรับ ใบกํากับภาษี/ใบเสร็จรับเงิน</h2>
+        <form action="/both" method=post enctype=multipart/form-data>
+            <input type=file name=pdfs multiple required>
+            <input type=submit value="แปลงไฟล์">
+        </form>
+    </div>
+</body>
+</html>
+'''
 
-if uploaded_file:
-    df = pd.read_excel(uploaded_file)
+PREVIEW_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <title>PDF ที่แปลงแล้ว</title>
+    <style>
+        body {
+            font-family: 'Sarabun', sans-serif;
+            background-color: #f8f9fa;
+            color: #333;
+            padding: 40px;
+        }
+        h2 {
+            text-align: center;
+            color: #2c3e50;
+        }
+        ul {
+            list-style: none;
+            padding: 0;
+            max-width: 800px;
+            margin: 20px auto;
+        }
+        li {
+            background: white;
+            margin-bottom: 10px;
+            padding: 15px 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        li span {
+            font-weight: bold;
+        }
+        a {
+            text-decoration: none;
+            color: #3498db;
+            margin-left: 10px;
+        }
+        a:hover {
+            color: #21618c;
+        }
+        form {
+            text-align: center;
+            margin-top: 30px;
+        }
+        button {
+            background-color: #27ae60;
+            color: white;
+            padding: 10px 20px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #1e8449;
+        }
+    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Sarabun&display=swap" rel="stylesheet">
+</head>
+<body>
+    <h2>📄 รายการ PDF ที่แปลงแล้ว:</h2>
+    <ul>
+    {% for file in files %}
+        <li>
+            <span>{{ file }}</span>
+            <div>
+                <a href="/preview/{{ mode }}/{{ file }}" target="_blank">ดู / พิมพ์</a>
+                |
+                <a href="/pdf/{{ file }}" target="_blank">ดาวน์โหลด</a>
+            </div>
+        </li>
+    {% endfor %}
+    </ul>
+    <form action="/download_zip/{{ mode }}" method="post">
+        <input type="hidden" name="files" value="{{ ','.join(files) }}">
+        <button type="submit">📦 ดาวน์โหลด ZIP</button>
+    </form>
+</body>
+</html>
+'''
 
-    if 'Item' not in df.columns or 'URL' not in df.columns:
-        st.error("❌ โปรดตรวจสอบว่าไฟล์มีคอลัมน์ 'Item' และ 'URL'")
-    else:
-        success_count = 0
-        zip_buffer = io.BytesIO()
 
-        if st.button("🚀 เริ่มดาวน์โหลดและบีบอัดรูปภาพ"):
-            st.session_state.failed_downloads = []
+@app.route('/', methods=['GET'])
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
-            total = len(df)
-            progress_bar = st.progress(0, text="📅 เริ่มต้นการดาวน์โหลด...")
+@app.route('/tax', methods=['POST'])
+def handle_tax():
+    return handle_conversion("tax")
 
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                    futures = [executor.submit(download_image, (idx + 2, row['Item'], row['URL'])) for idx, row in df.iterrows()]
+@app.route('/receipt', methods=['POST'])
+def handle_receipt():
+    return handle_conversion("receipt")
 
-                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                        result = future.result()
-                        if result:
-                            index, filename, url, content = result
-                            if content:
-                                zipf.writestr(f"{filename}.jpg", content)
-                                success_count += 1
-                            else:
-                                st.session_state.failed_downloads.append({'Row': index, 'Item': filename, 'URL': url})
+@app.route('/both', methods=['POST'])
+def handle_both():
+    return handle_conversion("both")
 
-                        progress_bar.progress((i + 1) / total, text=f"📷 กำลังดาวน์โหลดรูปภาพ ({i + 1}/{total})")
+def handle_conversion(mode):
+    converted_files = []
 
-            zip_buffer.seek(0)
+    for uploaded_file in request.files.getlist("pdfs"):
+        if uploaded_file.filename.endswith('.pdf'):
+            filepath = os.path.join(UPLOAD_FOLDER, uploaded_file.filename)
+            uploaded_file.save(filepath)
 
-            st.success(f"✅ ดาวน์โหลดรูปเสร็จสิ้น {success_count} รายการ!")
-            st.download_button(
-                label="📦 ดาวน์โหลด ZIP",
-                data=zip_buffer,
-                file_name="downloaded_images.zip",
-                mime="application/zip"
-            )
+            new_pdf_path = process_pdf(filepath, mode)
+            arcname = os.path.basename(new_pdf_path)  # ไม่ต้องเติม WS_ ซ้ำ
+            converted_files.append(arcname)
 
-        if st.session_state.failed_downloads:
-            st.warning(f"🚧 Item ที่ดาวน์โหลดไม่สำเร็จ {len(st.session_state.failed_downloads)} รายการ:")
-            failed_df_display = pd.DataFrame(st.session_state.failed_downloads)[['Row', 'Item', 'URL']]
-            st.dataframe(failed_df_display, use_container_width=True, hide_index=True)
 
-            failed_df_csv = pd.DataFrame(st.session_state.failed_downloads)[['Item', 'URL']]
-            failed_csv = failed_df_csv.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="🔧 รายชื่อไฟล์ที่โหลดไม่สำเร็จ (CSV)",
-                data=failed_csv,
-                file_name="failed_downloads.csv",
-                mime="text/csv"
-            )
+    return render_template_string(PREVIEW_TEMPLATE, files=converted_files, mode=mode)
+
+@app.route('/download_zip/<mode>', methods=['POST'])
+def download_zip(mode):
+    file_list = request.form['files'].split(',')
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w') as zipf:
+        for fname in file_list:
+            path = os.path.join(OUTPUT_FOLDER, fname)
+            zipf.write(path, fname)
+    zip_buffer.seek(0)
+    return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name=f'converted_{mode}.zip')
+
+@app.route('/preview/<mode>/<filename>')
+def preview_pdf(mode, filename):
+    return f'''
+    <!DOCTYPE html>
+    <html lang="th">
+    <head>
+        <meta charset="utf-8">
+        <title>พิมพ์: {filename}</title>
+        <script>
+            window.onload = function() {{
+                const printWindow = window.open("/pdf/{filename}", "_blank");
+                setTimeout(() => {{
+                    printWindow.print();
+                }}, 1000);
+            }};
+        </script>
+    </head>
+    <body>
+        <p>กำลังโหลดไฟล์ {filename} เพื่อสั่งพิมพ์...</p>
+    </body>
+    </html>
+    '''
+
+
+@app.route('/pdf/<filename>')
+def serve_pdf(filename):
+    return send_file(os.path.join(OUTPUT_FOLDER, filename))
+
+def process_pdf(pdf_path, mode):
+    doc = fitz.open(pdf_path)
+    first_page = doc[0]
+
+    config = header_settings.get(mode, header_settings["both"])
+    rect = fitz.Rect(*config["rect"])
+    first_page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
+
+    font_path = "Sarabun-Thin.ttf"
+    first_page.insert_font("THSarabun", fontfile=font_path)
+
+    y = config["text_y"]
+    for line in new_header_lines:
+        first_page.insert_text((config["text_x"], y), line, fontsize=config["fontsize"], fontname="THSarabun")
+        y += config["line_spacing"]
+
+    new_filename = "WS_" + os.path.basename(pdf_path)
+    output_path = os.path.join(OUTPUT_FOLDER, new_filename)
+    doc.save(output_path)
+    doc.close()
+    return output_path
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=8080, debug=True)
