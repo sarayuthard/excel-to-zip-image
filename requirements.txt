@@ -2,7 +2,3 @@ streamlit
 pandas
 requests
 openpyxl
-flask
-fitz
-frontend
-tools
